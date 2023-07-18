@@ -20,7 +20,16 @@ print("""
 """)
 
 mc_path = 'data/clean_McDonald_s_Reviews.txt'
-mc_reviews = open(mc_path, 'r').read().splitlines()
+dirty_reviews = open(mc_path, 'r').read().splitlines()
+
+mc_reviews = []
+for review in dirty_reviews:
+    clean_review = ''
+    for ch in review:
+        if ord(ch) < 128:
+            clean_review += ch
+    mc_reviews.append(clean_review)
+
 print('Read:', mc_path)
 chars = sorted(list(set(''.join(mc_reviews)))) # Unique characters in data set
 vocab_size = len(chars)
@@ -67,7 +76,7 @@ W = torch.randn((vocab_size, vocab_size), generator=g, requires_grad=True)
 
 # Gradient based optimization 
 print("TRAIN (gradient descent this might take a while):")
-for k in tqdm(range(5)):
+for k in tqdm(range(14400)):
     # Forward pass
     xenc = F.one_hot(xs, num_classes=vocab_size).float() # Input to the neural network: one_hot encoding
     logits = xenc @ W # Predict log-counts
@@ -84,8 +93,7 @@ for k in tqdm(range(5)):
     # Update
     W.data += -100 * W.grad
     
-
-for i in range(10): # Write 10 reviews
+for i in range(100): # Write 10 reviews
     out = []
     ix = 0
     while True:
@@ -104,20 +112,20 @@ for i in range(10): # Write 10 reviews
     
 # Compute average negative log likelihood (aka loss)
 # NOTE(caleb): This single number summarizes model quality (lower is better)
-log_likelihood = 0.0
-n = 0
-for review in mc_reviews[:1]: # nll of this model producing the first review
-    print(review)
-    chs = [special] + list(review) + [special]
-    for ch1, ch2 in zip(chs, chs[1:]):
-        ch1_index = stoi[ch1]
-        ch2_index = stoi[ch2]
-        prob = P[ch1_index, ch2_index]
-        logprob = torch.log(prob)
-        log_likelihood += logprob
-        n += 1
-        print(f'{ch1}{ch2}: {prob:.4f} {logprob:.4f}')
-print(f'{log_likelihood=}')
-nll = -log_likelihood
-print(f'{nll=}')
-print(f'{nll/n}') # NOTE(caleb): Loss
+# log_likelihood = 0.0
+# n = 0
+# for review in mc_reviews[:1]: # nll of this model producing the first review
+#     print(review)
+#     chs = [special] + list(review) + [special]
+#     for ch1, ch2 in zip(chs, chs[1:]):
+#         ch1_index = stoi[ch1]
+#         ch2_index = stoi[ch2]
+#         prob = P[ch1_index, ch2_index]
+#         logprob = torch.log(prob)
+#         log_likelihood += logprob
+#         n += 1
+#         print(f'{ch1}{ch2}: {prob:.4f} {logprob:.4f}')
+# print(f'{log_likelihood=}')
+# nll = -log_likelihood
+# print(f'{nll=}')
+# print(f'{nll/n}') # NOTE(caleb): Loss
