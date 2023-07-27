@@ -1,6 +1,7 @@
 /// Crack at a word level prob model.
 const std = @import("std");
 
+const debug = std.debug;
 const hash_map = std.hash_map;
 const mem = std.mem;
 const rand = std.rand;
@@ -12,14 +13,12 @@ const hidden_layer_neuron_count = 10;
 
 fn HeapVector(comptime T: type) type {
     return struct {
-        const Self = @This();
-
         data: []T,
         dim: usize,
         ally: mem.Allocator,
 
         pub fn initPreheated(ally: mem.Allocator, dim: usize) !HeapVector(T) {
-            var result = Self{
+            var result = HeapVector(T){
                 .data = undefined,
                 .dim = dim,
                 .ally = ally,
@@ -28,7 +27,16 @@ fn HeapVector(comptime T: type) type {
             return result;
         }
 
-        pub fn deinit(self: *Self) void {
+        pub fn addHeapVector(a: HeapVector(T), b: HeapVector(T)) !HeapVector(T) {
+            debug.assert(a.dim == b.dim);
+            var result = try HeapVector(T).initPreheated(a.ally, a.dim);
+            var row_index: usize = 0;
+            while (row_index < a.dim) : (row_index += 1)
+                result.data[row_index] = a.data[row_index] + b.data[row_index];
+            return result;
+        }
+
+        pub fn deinit(self: *HeapVector(T)) void {
             self.ally.free(self.data);
         }
     };
@@ -44,7 +52,7 @@ fn HeapMatrix(comptime T: type) type {
         ally: mem.Allocator,
 
         pub fn initPreheated(ally: mem.Allocator, m: usize, n: usize) !HeapMatrix(T) {
-            var result = Self{
+            var result = HeapMatrix(T){
                 .data = undefined,
                 .m = m,
                 .n = n,
@@ -54,11 +62,11 @@ fn HeapMatrix(comptime T: type) type {
             return result;
         }
 
-        pub fn deinit(self: *Self) void {
+        pub fn deinit(self: *HeapMatrix(T)) void {
             self.ally.free(self.data);
         }
 
-        pub fn multHeapVector(self: Self, v: HeapVector(T)) !HeapVector(T) {
+        pub fn multHeapVector(self: HeapMatrix(T), v: HeapVector(T)) !HeapVector(T) {
             var result = try HeapVector(T).initPreheated(self.ally, self.m);
             var row_index: usize = 0;
             while (row_index < self.m) : (row_index += 1) {
@@ -69,11 +77,6 @@ fn HeapMatrix(comptime T: type) type {
             return result;
         }
     };
-}
-
-fn matVecMult(comptime T: type, mat: []T, vec: T) void {
-    _ = mat;
-    _ = vec;
 }
 
 fn buildDataset(
@@ -162,17 +165,34 @@ pub fn main() !void {
     }
     std.debug.print("Contstructed context matrix: {d}kb\n", .{@sizeOf(@Vector(feature_length, f32)) * vocab_count / 1024});
 
-    var output_layer_matrix = try HeapMatrix(f32).initPreheated(arena, vocab_count, hidden_layer_neuron_count);
-    var output_layer_bias_vector = try HeapVector(f32).initPreheated(arena, vocab_count);
+    // TODO(caleb): Save arena state and restore to it later
 
-    _ = try output_layer_matrix.multHeapVector(output_layer_bias_vector);
+    // var output_layer_matrix = try HeapMatrix(f32).initPreheated(arena, vocab_count, hidden_layer_neuron_count);
+    // var output_layer_bias_vector = try HeapVector(f32).initPreheated(arena, vocab_count);
 
     var hidden_layer_matrix = try HeapMatrix(f32).initPreheated(arena, hidden_layer_neuron_count, feature_length * block_length);
     var hidden_layer_bias_vector = try HeapVector(f32).initPreheated(arena, hidden_layer_neuron_count);
-    _ = hidden_layer_matrix;
-    _ = hidden_layer_bias_vector;
-    var catd_feature_vector: @Vector(feature_length * block_length, f32) = undefined; // NOTE(caleb): aka the activation layer.
-    _ = catd_feature_vector;
+
+    // FORWARD PHASE ---------------------------------------------------------------------------------
+
+    var random_context_indicies = HeapVector(usize).initPreheated(arena, vocab_count);
+    for (&random_context_indicies.data) |*elm| elm.* = rng.uintLessThan(usize, vocab_count);
+
+    // 1) Forward computation for word features layer. NOTE(caleb): (activation layer)
+    var catd_feature_vector = try HeapVector(f32).initPreheated(arena, feature_length * block_length);
+
+    // Each peice of context
+
+    // 2) Forward computation for the hidden layer
+    const weights_multd_catd_feature_vector = try HeapMatrix(f32).multHeapVector(
+        hidden_layer_matrix,
+        catd_feature_vector,
+    );
+    var tan_hidden_layer = try HeapVector(f32).addHeapVector(
+        weights_multd_catd_feature_vector,
+        hidden_layer_bias_vector,
+    );
+    for (&tan_hidden_layer.data) |*elm| elm.* = @tan(elm.*);
 
     // Multiply cated_feature_vector with hidden layer matrix
 
