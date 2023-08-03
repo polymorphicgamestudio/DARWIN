@@ -23,6 +23,12 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
+    exe.addObjectFile("./llama.lib");
+    exe.addIncludePath("C:/caleb/src/llama.cpp/");
+    exe.addIncludePath("C:/caleb/src/llama.cpp/examples");
+    exe.linkLibC();
+    exe.linkLibCpp();
+    exe.want_lto = false;
 
     // This declares intent for the executable to be installed into the
     // standard location when the user invokes the "install" step (the default

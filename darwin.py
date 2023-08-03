@@ -103,6 +103,8 @@ for i in tqdm(range(200000)):
     
     # Forward pass
     emb = C[Xtr[ix]]
+    print(emb)
+    break 
     # emb = torch.zeros((len(X), block_size, feature_length))
     # for x_index, context in enumerate(X):
     #     for context_index, tok_index in enumerate(context):

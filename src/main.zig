@@ -1,209 +1,166 @@
-/// Crack at a word level prob model.
+const c = @cImport({
+    @cInclude("llama.h");
+});
+
 const std = @import("std");
-
-const debug = std.debug;
-const hash_map = std.hash_map;
 const mem = std.mem;
-const rand = std.rand;
+const heap = std.heap;
+const process = std.process;
 
-const data_path = "data/tiny_shakes.txt";
-const block_length = 3;
-const feature_length = 4;
-const hidden_layer_neuron_count = 10;
+const GPTParams = struct {
+    const Self = @This();
 
-fn HeapVector(comptime T: type) type {
-    return struct {
-        data: []T,
-        dim: usize,
-        ally: mem.Allocator,
+    ally: mem.Allocator,
 
-        pub fn initPreheated(ally: mem.Allocator, dim: usize) !HeapVector(T) {
-            var result = HeapVector(T){
-                .data = undefined,
-                .dim = dim,
-                .ally = ally,
-            };
-            result.data = try ally.alloc(T, dim);
-            return result;
-        }
+    seed: u32 = 1, // RNG seed
+    n_threads: i32 = 0,
+    n_predict: i32 = -1, // new tokens to predict
+    n_ctx: i32 = 512, // context size
+    n_batch: i32 = 512, // batch size for prompt processing (must be >=32 to use BLAS)
+    n_gqa: i32 = 1, // grouped-query attention factor (TODO: move to hparams)
+    n_keep: i32 = 0, // number of tokens to keep from initial prompt
+    n_chunks: i32 = -1, // max number of chunks to process (-1 = unlimited)
+    n_gpu_layers: i32 = 0, // number of layers to store in VRAM
+    main_gpu: i32 = 0, // the GPU that is used for scratch and small tensors
+    tensor_split: [c.LLAMA_MAX_DEVICES]f32 = [c.LLAMA_MAX_DEVICES]f32{0}, // how split tensors should be distributed across GPUs
+    n_probs: i32 = 0, // if greater than 0, output the probabilities of top n_probs tokens.
+    rms_norm_eps: f32 = c.LLAMA_DEFAULT_RMS_EPS, // rms norm epsilon
+    rope_freq_base: f32 = 10000.0, // RoPE base frequency
+    rope_freq_scale: f32 = 1.0, // RoPE frequency scaling factor
 
-        pub fn addHeapVector(a: HeapVector(T), b: HeapVector(T)) !HeapVector(T) {
-            debug.assert(a.dim == b.dim);
-            var result = try HeapVector(T).initPreheated(a.ally, a.dim);
-            var row_index: usize = 0;
-            while (row_index < a.dim) : (row_index += 1)
-                result.data[row_index] = a.data[row_index] + b.data[row_index];
-            return result;
-        }
+    // sampling parameters
+    logit_bias: std.AutoHashMap(c.llama_token, f32) = undefined, // logit bias for specific tokens
+    top_k: i32 = 40, // <= 0 to use vocab size
+    top_p: f32 = 0.95, // 1.0 = disabled
+    tfs_z: f32 = 1.00, // 1.0 = disabled
+    typical_p: f32 = 1.00, // 1.0 = disabled
+    temp: f32 = 0.80, // 1.0 = disabled
+    repeat_penalty: f32 = 1.10, // 1.0 = disabled
+    repeat_last_n: i32 = 64, // last n tokens to penalize (0 = disable penalty, -1 = context size)
+    frequency_penalty: f32 = 0.00, // 0.0 = disabled
+    presence_penalty: f32 = 0.00, // 0.0 = disabled
+    mirostat: i32 = 0, // 0 = disabled, 1 = mirostat, 2 = mirostat 2.0
+    mirostat_tau: f32 = 5.00, // target entropy
+    mirostat_eta: f32 = 0.10, // learning rate
 
-        pub fn deinit(self: *HeapVector(T)) void {
-            self.ally.free(self.data);
-        }
-    };
-}
+    // Classifier-Free Guidance
+    // https://arxiv.org/abs/2306.17806
+    cfg_negative_prompt: []u8 = undefined, // string to help guidance
+    cfg_scale: f32 = 1.0, // How strong is guidance
 
-fn HeapMatrix(comptime T: type) type {
-    return struct {
-        const Self = @This();
+    model: [:0]const u8 = "models/7B/ggml-model.bin", // model path
+    model_alias: []const u8 = "unknown", // model alias
+    prompt: []const u8 = undefined,
+    path_prompt_cache: []const u8 = "", // path to file for saving/loading prompt eval state
+    input_prefix: []const u8 = "", // string to prefix user inputs with
+    input_suffix: []const u8 = "", // string to suffix user inputs with
+    grammar: []const u8 = "", // optional BNF-like grammar to constrain sampling
+    antiprompt: std.ArrayList([]u8) = undefined, // string upon seeing which more user input is prompted
 
-        data: []T,
-        m: usize,
-        n: usize,
-        ally: mem.Allocator,
+    lora_adapter: [:0]const u8 = "", // lora adapter path
+    lora_base: [:0]const u8 = "", // base model path for the lora adapter
 
-        pub fn initPreheated(ally: mem.Allocator, m: usize, n: usize) !HeapMatrix(T) {
-            var result = HeapMatrix(T){
-                .data = undefined,
-                .m = m,
-                .n = n,
-                .ally = ally,
-            };
-            result.data = try ally.alloc(T, m * n);
-            return result;
-        }
+    hellaswag: bool = false, // compute HellaSwag score over random tasks from datafile supplied in prompt
+    hellaswag_tasks: isize = 400, // number of tasks to use when computing the HellaSwag score
 
-        pub fn deinit(self: *HeapMatrix(T)) void {
-            self.ally.free(self.data);
-        }
+    low_vram: bool = false, // if true, reduce VRAM usage at the cost of performance
+    mul_mat_q: bool = false, // if true, use experimental mul_mat_q kernels
+    memory_f16: bool = true, // use f16 instead of f32 for memory kv
+    random_prompt: bool = false, // do not randomize prompt if none provided
+    use_color: bool = false, // use color to distinguish generations and inputs
+    interactive: bool = false, // interactive mode
+    prompt_cache_all: bool = false, // save user input and generations to prompt cache
+    prompt_cache_ro: bool = false, // open the prompt cache read-only and do not update it
 
-        pub fn multHeapVector(self: HeapMatrix(T), v: HeapVector(T)) !HeapVector(T) {
-            var result = try HeapVector(T).initPreheated(self.ally, self.m);
-            var row_index: usize = 0;
-            while (row_index < self.m) : (row_index += 1) {
-                var col_index: usize = 0;
-                while (col_index < self.n) : (col_index += 1)
-                    result.data[row_index] += self.data[row_index * self.n + col_index] * v.data[row_index];
+    embedding: bool = false, // get only sentence embedding
+    interactive_first: bool = false, // wait for user input immediately
+    multiline_input: bool = false, // reverse the usage of `\`
+
+    input_prefix_bos: bool = false, // prefix BOS to user inputs, preceding input_prefix
+    instruct: bool = false, // instruction mode (used for Alpaca models)
+    penalize_nl: bool = true, // consider newlines as a repeatable token
+    perplexity: bool = false, // compute perplexity over the prompt
+    use_mmap: bool = true, // use mmap for faster loads
+    use_mlock: bool = false, // use mlock to keep model in memory
+    mem_test: bool = false, // compute maximum memory usage
+    numa: bool = false, // attempt optimizations that help on some NUMA systems
+    export_cgraph: bool = false, // export the computation graph
+    verbose_prompt: bool = false, // print prompt tokens before generation
+
+    pub fn init(ally: mem.Allocator) Self {
+        var result = Self{ .ally = ally };
+        result.n_threads = @as(i32, @intCast(std.Thread.getCpuCount() catch unreachable));
+        return result;
+    }
+
+    pub fn parse(self: *Self, arg_iter: *process.ArgIterator) !void {
+        while (arg_iter.next()) |arg| {
+            if (mem.eql(u8, arg, "-p") or mem.eql(u8, arg, "--prompt")) {
+                self.prompt = try self.ally.dupe(u8, arg_iter.next() orelse unreachable);
+            } else if (mem.eql(u8, arg, "-m") or mem.eql(u8, arg, "--model")) {
+                self.model = try self.ally.dupeZ(u8, arg_iter.next() orelse unreachable);
             }
-            return result;
-        }
-    };
-}
-
-fn buildDataset(
-    data_file: std.fs.File,
-    vocab: std.AutoHashMap(u64, usize),
-    inputs: *std.ArrayList(@Vector(block_length, usize)),
-    outputs: *std.ArrayList(usize),
-) !void {
-    var line_buffer: [1024]u8 = undefined; // 1Kb should be more than enough for a line...
-    var data_fbs = std.io.fixedBufferStream(&line_buffer);
-    var data_reader = data_file.reader();
-    var data_writer = data_fbs.writer();
-
-    var context = mem.zeroes(@Vector(block_length, usize));
-    try data_file.seekTo(0);
-    while (true) {
-        data_fbs.reset();
-        data_reader.streamUntilDelimiter(data_writer, '\n', null) catch break;
-        if (data_fbs.getWritten().len == 0) continue;
-
-        // No nasty CRs please.
-        std.debug.assert(data_fbs.getWritten()[data_fbs.pos - 1] != '\r');
-
-        var word_toks = mem.splitSequence(u8, data_fbs.getWritten(), " ");
-        var tok: ?[]const u8 = undefined;
-        tok = word_toks.first();
-        while (tok != null) : (tok = word_toks.next()) {
-            const k = hash_map.hashString(tok.?);
-            const v = vocab.get(k) orelse unreachable;
-            try inputs.append(context);
-            try outputs.append(v);
-            var context_index = @as(usize, 1);
-            while (context_index < block_length) : (context_index += 1)
-                context[context_index - 1] = context[context_index];
-            context[block_length - 1] = v;
         }
     }
-}
+};
+
+var ctx_ptr: *?*c.llama_context = undefined;
 
 pub fn main() !void {
-    var arena_instance = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    var arena_instance = heap.ArenaAllocator.init(heap.page_allocator);
     defer arena_instance.deinit();
     const arena = arena_instance.allocator();
 
-    var xoshi = rand.Xoroshiro128.init(1);
-    const rng = xoshi.random();
+    var stderr_file = std.io.getStdErr();
+    const stderr = stderr_file.writer();
 
-    var vocab = std.AutoHashMap(u64, usize).init(arena);
-    var vocab_count = @as(usize, 1);
-    const data_file = try std.fs.cwd().openFile(data_path, .{});
-    defer data_file.close();
+    var gpt_params = GPTParams.init(arena);
+    var arg_iter = try process.argsWithAllocator(arena);
+    try gpt_params.parse(&arg_iter);
 
-    // Build vocab from input file
-    var line_buffer: [1024]u8 = undefined; // 1Kb should be more than enough for a line...
-    var data_fbs = std.io.fixedBufferStream(&line_buffer);
-    var data_reader = data_file.reader();
-    var data_writer = data_fbs.writer();
-    while (true) {
-        data_fbs.reset();
-        data_reader.streamUntilDelimiter(data_writer, '\n', null) catch break;
-        if (data_fbs.getWritten().len == 0) continue;
+    c.llama_backend_init(gpt_params.numa);
 
-        // No nasty CRs please.
-        std.debug.assert(data_fbs.getWritten()[data_fbs.pos - 1] != '\r');
+    var lparams = mem.zeroes(c.llama_context_params);
+    lparams.n_ctx = gpt_params.n_ctx;
+    lparams.n_batch = gpt_params.n_batch;
+    lparams.n_gqa = gpt_params.n_gqa;
+    lparams.rms_norm_eps = gpt_params.rms_norm_eps;
+    lparams.n_gpu_layers = gpt_params.n_gpu_layers;
+    lparams.main_gpu = gpt_params.main_gpu;
+    lparams.tensor_split = &gpt_params.tensor_split;
+    lparams.low_vram = gpt_params.low_vram;
+    lparams.mul_mat_q = gpt_params.mul_mat_q;
+    lparams.seed = gpt_params.seed;
+    lparams.f16_kv = gpt_params.memory_f16;
+    lparams.use_mmap = gpt_params.use_mmap;
+    lparams.use_mlock = gpt_params.use_mlock;
+    lparams.logits_all = gpt_params.perplexity;
+    lparams.embedding = gpt_params.embedding;
+    lparams.rope_freq_base = gpt_params.rope_freq_base;
+    lparams.rope_freq_scale = gpt_params.rope_freq_scale;
 
-        var word_toks = mem.splitSequence(u8, data_fbs.getWritten(), " ");
-        var tok: ?[]const u8 = undefined;
-        tok = word_toks.first();
-        while (tok != null) : (tok = word_toks.next()) {
-            const k = hash_map.hashString(tok.?);
-            if (vocab.contains(k)) continue;
-            try vocab.putNoClobber(k, vocab_count);
-            vocab_count += 1;
+    var model = c.llama_load_model_from_file(gpt_params.model, lparams);
+    if (model == null) {
+        try stderr.print("failed to load model '{s}'\n", .{gpt_params.model});
+        process.exit(1);
+    }
+
+    var lctx = c.llama_new_context_with_model(model, lparams);
+    if (lctx == null) {
+        try stderr.print("failed to create context with model '{s}'\n", .{gpt_params.model});
+        process.exit(1);
+    }
+
+    if (gpt_params.lora_adapter.len != 0) {
+        var err = c.llama_model_apply_lora_from_file(model, gpt_params.lora_adapter, if (gpt_params.lora_base.len == 0) null else gpt_params.lora_base, gpt_params.n_threads);
+        if (err != 0) {
+            try stderr.print("failed to apply lora adapter\n", .{});
+            c.llama_free(lctx);
+            c.llama_free_model(model);
         }
     }
 
-    var inputs = std.ArrayList(@Vector(block_length, usize)).init(arena);
-    var outputs = std.ArrayList(usize).init(arena);
-    try buildDataset(data_file, vocab, &inputs, &outputs);
-
-    var context_matrix = try arena.alloc(@Vector(feature_length, f32), vocab_count);
-    for (context_matrix) |*row| {
-        var feature_index = @as(usize, 0);
-        while (feature_index < feature_length) : (feature_index += 1)
-            row[feature_index] = rng.float(f32);
-    }
-    std.debug.print("Contstructed context matrix: {d}kb\n", .{@sizeOf(@Vector(feature_length, f32)) * vocab_count / 1024});
-
-    // TODO(caleb): Save arena state and restore to it later
-
-    // var output_layer_matrix = try HeapMatrix(f32).initPreheated(arena, vocab_count, hidden_layer_neuron_count);
-    // var output_layer_bias_vector = try HeapVector(f32).initPreheated(arena, vocab_count);
-
-    var hidden_layer_matrix = try HeapMatrix(f32).initPreheated(arena, hidden_layer_neuron_count, feature_length * block_length);
-    var hidden_layer_bias_vector = try HeapVector(f32).initPreheated(arena, hidden_layer_neuron_count);
-
-    // FORWARD PHASE ---------------------------------------------------------------------------------
-
-    var random_context_indicies = HeapVector(usize).initPreheated(arena, vocab_count);
-    for (&random_context_indicies.data) |*elm| elm.* = rng.uintLessThan(usize, vocab_count);
-
-    // 1) Forward computation for word features layer. NOTE(caleb): (activation layer)
-    var catd_feature_vector = try HeapVector(f32).initPreheated(arena, feature_length * block_length);
-
-    // Each peice of context
-
-    // 2) Forward computation for the hidden layer
-    const weights_multd_catd_feature_vector = try HeapMatrix(f32).multHeapVector(
-        hidden_layer_matrix,
-        catd_feature_vector,
-    );
-    var tan_hidden_layer = try HeapVector(f32).addHeapVector(
-        weights_multd_catd_feature_vector,
-        hidden_layer_bias_vector,
-    );
-    for (&tan_hidden_layer.data) |*elm| elm.* = @tan(elm.*);
-
-    // Multiply cated_feature_vector with hidden layer matrix
-
-    // for (outputs.items, 0..) |expected, output_index|
-    //     std.debug.print("{any} => {d}\n", .{ inputs.items[output_index], expected });
-
-    // var vocab_iter = vocab.valueIterator();
-    // while (vocab_iter.next()) |v| {
-    //     std.debug.print("{d}, ", .{v.*});
-    // }
-
-    // next step is to build C - context matrix
-    std.process.cleanExit();
+    // var ctx_guidance: ?*c.llama_guidance = null;
+    // _ = ctx_guidance;
+    ctx_ptr = &lctx;
 }
