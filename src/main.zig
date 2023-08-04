@@ -49,8 +49,8 @@ const GPTParams = struct {
     cfg_scale: f32 = 1.0, // How strong is guidance
 
     model: [:0]const u8 = "models/7B/ggml-model.bin", // model path
-    model_alias: []const u8 = "unknown", // model alias
-    prompt: []const u8 = undefined,
+    model_alias: [:0]const u8 = "unknown", // model alias
+    prompt: [:0]const u8 = "",
     path_prompt_cache: []const u8 = "", // path to file for saving/loading prompt eval state
     input_prefix: []const u8 = "", // string to prefix user inputs with
     input_suffix: []const u8 = "", // string to suffix user inputs with
@@ -96,13 +96,24 @@ const GPTParams = struct {
     pub fn parse(self: *Self, arg_iter: *process.ArgIterator) !void {
         while (arg_iter.next()) |arg| {
             if (mem.eql(u8, arg, "-p") or mem.eql(u8, arg, "--prompt")) {
-                self.prompt = try self.ally.dupe(u8, arg_iter.next() orelse unreachable);
+                self.prompt = try self.ally.dupeZ(u8, arg_iter.next() orelse unreachable);
             } else if (mem.eql(u8, arg, "-m") or mem.eql(u8, arg, "--model")) {
                 self.model = try self.ally.dupeZ(u8, arg_iter.next() orelse unreachable);
             }
         }
     }
 };
+
+fn tokenizeInput(ally: std.mem.Allocator, ctx: ?*c.llama_context, text: [:0]const u8) !std.ArrayList(c.llama_token) {
+    var embd_inp = std.ArrayList(c.llama_token).init(ally);
+
+    try embd_inp.resize(text.len + 1); // NOTE(caleb): +1 for BOS (beginning of sentance token)
+    const n = c.llama_tokenize(ctx, text.ptr, embd_inp.items.ptr, @as(c_int, @intCast(embd_inp.items.len)), true);
+    std.debug.assert(n >= 0);
+    try embd_inp.resize(@as(usize, @intCast(n)));
+
+    return embd_inp;
+}
 
 var ctx_ptr: *?*c.llama_context = undefined;
 
@@ -150,6 +161,7 @@ pub fn main() !void {
         try stderr.print("failed to create context with model '{s}'\n", .{gpt_params.model});
         process.exit(1);
     }
+    ctx_ptr = &lctx;
 
     if (gpt_params.lora_adapter.len != 0) {
         var err = c.llama_model_apply_lora_from_file(model, gpt_params.lora_adapter, if (gpt_params.lora_base.len == 0) null else gpt_params.lora_base, gpt_params.n_threads);
@@ -157,10 +169,26 @@ pub fn main() !void {
             try stderr.print("failed to apply lora adapter\n", .{});
             c.llama_free(lctx);
             c.llama_free_model(model);
+            process.exit(1);
         }
     }
 
-    // var ctx_guidance: ?*c.llama_guidance = null;
-    // _ = ctx_guidance;
-    ctx_ptr = &lctx;
+    var ctx_guidance: ?*c.llama_context = null;
+    if (gpt_params.cfg_scale > 1.0) {
+        ctx_guidance = c.llama_new_context_with_model(model, lparams);
+    }
+
+    if (model == null) {
+        try stderr.print("unable to load model\n", .{});
+        process.exit(1);
+    }
+
+    _ = c.llama_print_system_info();
+
+    // Add a space in front of the first character to match OG llama tokenizer behavior
+    gpt_params.prompt = try std.fmt.allocPrintZ(arena, " {s}", .{gpt_params.prompt});
+
+    // Tokenize the prompt
+    var embd_inp = try tokenizeInput(arena, lctx, gpt_params.prompt);
+    defer embd_inp.deinit();
 }
