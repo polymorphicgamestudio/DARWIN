@@ -23,9 +23,9 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
-    exe.addObjectFile("./llama.lib");
-    exe.addIncludePath("C:/caleb/src/llama.cpp/");
-    exe.addIncludePath("C:/caleb/src/llama.cpp/examples");
+    exe.addObjectFile(.{ .path = "./llama.lib" });
+    exe.addIncludePath(.{ .path = "C:/caleb/src/llama.cpp/" });
+    exe.addIncludePath(.{ .path = "C:/caleb/src/llama.cpp/examples" });
     exe.linkLibC();
     exe.linkLibCpp();
     exe.want_lto = false;
